@@ -8,8 +8,8 @@ import (
 )
 
 type Response struct {
-    AccessToken string `json:"access_token"`
-    RefreshToken string `json:"refresh_token"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
 }
 
 type feedItem struct {
@@ -23,7 +23,7 @@ type feeds struct {
 }
 
 func Run() {
-    viper.SetConfigType("yaml")
+	viper.SetConfigType("yaml")
 
 	// Set the name for the config file
 	viper.SetConfigName("config")
@@ -43,12 +43,12 @@ func Run() {
 		panic(err)
 	}
 
-    auth := Auth()
-    var response Response
+	auth := Auth()
+	var response Response
 
-    err = json.Unmarshal([]byte(auth), &response)
+	err = json.Unmarshal([]byte(auth), &response)
 
-    // fmt.Println("🍺  response ", auth)
+	// fmt.Println("🍺  response ", auth)
 
 	// Get the pocket specific data
 	Config := BagConfig{}
@@ -62,15 +62,15 @@ func Run() {
 		panic(err)
 	}
 
-    // Config.AccessToken = response.AccessToken
+	// Config.AccessToken = response.AccessToken
 
-    // Update the configuration file
+	// Update the configuration file
 	// viper.Set("response.AccessToken", Config.AccessToken)
 
-    // fmt.Println("Config after auth", Config)
+	// fmt.Println("Config after auth", Config)
 	// viper.AddConfigPath("$HOME/.config/bag")
-    // viper.SafeWriteConfig()
-    // return
+	// viper.SafeWriteConfig()
+	// return
 
 	// Create a new struct for feeds
 	f := feeds{}
@@ -100,17 +100,16 @@ func Run() {
 		// parse the RSS url for that feed
 		feed, err := fp.ParseURL(element.URL)
 
-        if err != nil {
-            // Print the error to the console
-            // fmt.Println("🐛  ", err)
-            // fmt.Println(" ")
-            i++
-            // return
-            continue
-        }
+		if err != nil {
+			// Print the error to the console
+			// fmt.Println("🐛  ", err)
+			// fmt.Println(" ")
+			i++
+			// return
+			continue
+		}
 
-        // if err == nil {
-            
+		// if err == nil {
 
 		// Save the ID for the last post fetched
 		latest := element.LatestPost
@@ -137,18 +136,18 @@ func Run() {
 		// Add a space for prettyness
 		fmt.Println()
 
-        if len(feed.Items) > 0 {
-            // For the current feed update the latest post for the first url
-            // received from the rss parser
-            f.Feeds[i].LatestPost = feed.Items[0].Link
-        }
+		if len(feed.Items) > 0 {
+			// For the current feed update the latest post for the first url
+			// received from the rss parser
+			f.Feeds[i].LatestPost = feed.Items[0].Link
+		}
 
-        // Update the configuration file
-        viper.Set("feeds", f.Feeds)
+		// Update the configuration file
+		viper.Set("feeds", f.Feeds)
 
-        // Write the current viper config back to the config file
-        // ( with updated latestposts )
-        err = viper.WriteConfig()
+		// Write the current viper config back to the config file
+		// ( with updated latestposts )
+		err = viper.WriteConfig()
 
 		// Increase the count
 		i++

@@ -1,21 +1,20 @@
 package gobag
 
 import (
-    "fmt"
+	"fmt"
 )
 
 /*
-    The aim of this function is to collect inputs and save them encrypted in
-    the config
-    Inputs :
-    - Base URL (non encrypted?)
-    - Client ID
-    - Client Secret
-    - Username
-    - Password
+   The aim of this function is to collect inputs and save them encrypted in
+   the config
+   Inputs :
+   - Base URL (non encrypted?)
+   - Client ID
+   - Client Secret
+   - Username
+   - Password
 */
 
 func Remove() {
-    fmt.Println("This is removing")
+	fmt.Println("This is removing")
 }
-
