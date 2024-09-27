@@ -1,6 +1,6 @@
 module joshuaCrewe/go-rss-wallabag
 
-go 1.18
+go 1.23
 
 require (
 	github.com/mmcdole/gofeed v1.1.3
