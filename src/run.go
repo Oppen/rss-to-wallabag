@@ -198,7 +198,7 @@ func dlWorker(done chan<- struct{}, feedCh <-chan *feedItem, itemsCh chan<- []ur
 		printCh<- fmt.Sprintf("🍺  downloading %s", element.URL)
 		feed, err := fp.ParseURL(element.URL)
 		if err != nil {
-			errorCh<- fmt.Errorf("💥  error parsing feed [%s]: %v", element.URL, err)
+			errorCh<- fmt.Errorf("💥  %s: error parsing feed: %v", element.URL, err)
 			continue
 		}
 		printCh<- fmt.Sprintf("🚀  downloaded %s", element.URL)
