@@ -12,35 +12,50 @@ import (
 	"runtime"
 
 	"github.com/mmcdole/gofeed"
-	"github.com/spf13/viper"
 )
 
-type feedItem struct {
-	URL        string `mapstructure:"url"`
-	Tags       string `mapstructure:"tags"`
-	LatestPost string `mapstructure:"latestpost"`
-}
+/* TODO:
+ * 1. Replace gofeed with stdlib xml, only extract links
+ * 2. Make single file
+ * 3. Maybe use explicit Marshal/Unmarshal implementations to build with tinygo
+ *    This may help: https://github.com/json-iterator/tinygo
+ */
 
-type runConfig struct {
-	NumDlJobs int `mapstructure:"num_dl_jobs"`
-	BatchSize int `mapstructure:"batch_size"`
-}
-
-type feeds struct {
-	Feeds []feedItem
-}
-
-type urlTag struct {
+type Url struct {
 	URL string `json:"url"`
-	Tags string `json:"tags"`
+}
+
+type FeedItem struct {
+	URL        string `json:"url"`
+	LatestPost string `json:"latest_post"`
+}
+
+type RunConfig struct {
+	NumDlJobs int `json:"num_dl_jobs"`
+	BatchSize int `json:"batch_size"`
 }
 
 type BagConfig struct {
-	BaseUrl      string `mapstructure:"baseUrl"`
-	ClientID     string `mapstructure:"client_id"`
-	ClientSecret string `mapstructure:"client_secret"`
-	UserName     string `mapstructure:"username"`
-	Password     string `mapstructure:"password"`
+	BaseUrl      string `json:"base_url"`
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+	UserName     string `json:"username"`
+	Password     string `json:"password"`
+}
+
+type Config struct {
+	BagConfig BagConfig  `json:"server_config"`
+	RunConfig RunConfig  `json:"runtime_config"`
+	Feeds     []FeedItem `json:"feeds"`
+}
+
+func (cfg *Config) FillDefaults() {
+	if cfg.RunConfig.NumDlJobs == 0 {
+		cfg.RunConfig.NumDlJobs = runtime.NumCPU() * 4
+	}
+	if cfg.RunConfig.BatchSize == 0 {
+		cfg.RunConfig.BatchSize = 10
+	}
 }
 
 func Auth(bagcfg *BagConfig, client *http.Client) (string, error) {
@@ -100,16 +115,7 @@ func getCreds(key string) (value string) {
 	return string(key)
 }
 
-func SendBatch(items []urlTag, AccessToken string, baseUrl string, client *http.Client) error {
-	type PostURL struct {
-		URL string `json:"url"`
-	}
-	urls := make([]PostURL, len(items))
-	list := items
-	for i := range urls {
-		urls[i] = PostURL{list[i].URL}
-	}
-
+func SendBatch(urls []Url, AccessToken string, baseUrl string, client *http.Client) error {
 	post := func(Url string, arg string, payload interface{}) error {
 		b, err := json.Marshal(payload)
 		if err != nil {
@@ -141,18 +147,15 @@ func SendBatch(items []urlTag, AccessToken string, baseUrl string, client *http.
 	if err := post(baseUrl + "api/entries/lists", "urls", urls); err != nil {
 		return fmt.Errorf("upload failed: %v", err)
 	}
-	if err := post(baseUrl + "api/entries/tags/lists", "list", list); err != nil {
-		return fmt.Errorf("tagging failed: %v", err)
-	}
 	return nil
 }
 
-func ulWorker(accessToken string, baseURL string, batchSize int, client *http.Client, done chan<- struct{}, itemsCh <-chan []urlTag, printCh chan<- string, errorCh chan<- error) {
+func ulWorker(accessToken string, baseURL string, batchSize int, client *http.Client, done chan<- struct{}, itemsCh <-chan []Url, printCh chan<- string, errorCh chan<- error) {
 	defer func() {
 		done<- struct{}{}
 	}()
 
-	batch := make([]urlTag, 0, batchSize)
+	batch := make([]Url, 0, batchSize)
 
 	flush := func() {
 		defer func() {
@@ -186,7 +189,7 @@ func ulWorker(accessToken string, baseURL string, batchSize int, client *http.Cl
 	}
 }
 
-func dlWorker(done chan<- struct{}, feedCh <-chan *feedItem, itemsCh chan<- []urlTag, printCh chan<- string, errorCh chan<- error) {
+func dlWorker(done chan<- struct{}, feedCh <-chan *FeedItem, itemsCh chan<- []Url, printCh chan<- string, errorCh chan<- error) {
 	defer func() {
 		done<- struct{}{}
 	}()
@@ -204,17 +207,15 @@ func dlWorker(done chan<- struct{}, feedCh <-chan *feedItem, itemsCh chan<- []ur
 		printCh<- fmt.Sprintf("🚀  downloaded %s", element.URL)
 
 		latest := element.LatestPost
-		tags := element.Tags
 
-		// For each of the items in that feed
 		// TODO: maybe use a pool
-		items := make([]urlTag, 0, len(feed.Items))
+		items := make([]Url, 0, len(feed.Items))
 		for _, element := range feed.Items {
 
 			if element.Link == latest {
 				break
 			} else {
-				item := urlTag{element.Link, tags}
+				item := Url{element.Link}
 				items = append(items, item)
 			}
 		}
@@ -252,41 +253,25 @@ func printWorker(doneCh chan<- struct{}, printCh <-chan string, errorCh <-chan e
 }
 
 func Run() {
-	viper.SetConfigType("yaml")
-	viper.SetConfigName("config")
-	viper.AddConfigPath(".")
-	viper.AddConfigPath("$HOME/.local/share/go-rss-to-wallabag")
+	cfg_path, ok := os.LookupEnv("RSS2BAG_CONFIG")
+	if !ok {
+		cfg_path = os.ExpandEnv("$HOME/.local/share/go-rss-to-wallabag/config.json")
+	}
 
-	viper.SetDefault("num_dl_jobs", runtime.NumCPU() * 4)
-	viper.SetDefault("batch_size", 10)
-
-	err := viper.ReadInConfig()
+	cfg_bytes, err := os.ReadFile(cfg_path)
 	if err != nil {
 		panic(fmt.Errorf("💥  error reading config: %v", err))
 	}
 
-
-	var runcfg runConfig
-	err = viper.Unmarshal(&runcfg)
-	if err != nil {
-		panic(fmt.Errorf("💥  error reading config: %v", err))
+	var cfg Config
+	if err := json.Unmarshal(cfg_bytes, &cfg); err != nil {
+		panic(fmt.Errorf("💥  error parsing config: %v", err))
 	}
-
-	f := feeds{}
-	err = viper.Unmarshal(&f)
-	if err != nil {
-		panic(fmt.Errorf("💥  error reading config: %v", err))
-	}
-
-	bagcfg := &BagConfig{}
-	err = viper.Unmarshal(bagcfg)
-	if err != nil {
-		panic(fmt.Errorf("💥  error reading config: %v", err))
-	}
+	cfg.FillDefaults()
 
 	client := &http.Client{}
-	fmt.Println("🚀  Authenticating with Walabag instance: ", bagcfg.BaseUrl)
-	access_token, err := Auth(bagcfg, client)
+	fmt.Println("🚀  Authenticating with Walabag instance: ", cfg.BagConfig.BaseUrl)
+	access_token, err := Auth(&cfg.BagConfig, client)
 	if err != nil {
 		panic(fmt.Errorf("💥  authentication failed: %v", err))
 	}
@@ -297,24 +282,24 @@ func Run() {
 
 	go printWorker(printDone, printCh, errorCh)
 
-	dlDoneCh := make(chan struct{}, runcfg.NumDlJobs)
+	dlDoneCh := make(chan struct{}, cfg.RunConfig.NumDlJobs)
 	ulDoneCh := make(chan struct{})
-	feedCh := make(chan *feedItem, runcfg.NumDlJobs * 2)
-	itemsCh := make(chan []urlTag, runcfg.NumDlJobs * 2)
-	for _ = range(runcfg.NumDlJobs) {
+	feedCh := make(chan *FeedItem, cfg.RunConfig.NumDlJobs * 2)
+	itemsCh := make(chan []Url, cfg.RunConfig.NumDlJobs * 2)
+	for _ = range(cfg.RunConfig.NumDlJobs) {
 		go dlWorker(dlDoneCh, feedCh, itemsCh, printCh, errorCh)
 	}
 
-	go ulWorker(access_token, bagcfg.BaseUrl, runcfg.BatchSize, client, ulDoneCh, itemsCh, printCh, errorCh)
+	go ulWorker(access_token, cfg.BagConfig.BaseUrl, cfg.RunConfig.BatchSize, client, ulDoneCh, itemsCh, printCh, errorCh)
 
-	for i := range f.Feeds {
-		element := &f.Feeds[i]
+	for i := range cfg.Feeds {
+		element := &cfg.Feeds[i]
 		feedCh<- element
 	}
 	close(feedCh)
 
 	// Wait for dl workers to finish
-	for _ = range runcfg.NumDlJobs {
+	for _ = range cfg.RunConfig.NumDlJobs {
 		_ = <-dlDoneCh
 	}
 	close(itemsCh)
@@ -324,9 +309,13 @@ func Run() {
 	close(errorCh)
 	_ = <-printDone
 
-	viper.Set("feeds", f.Feeds)
-	err = viper.WriteConfig()
+	cfg_bytes, err = json.MarshalIndent(&cfg, "", "    ")
 	if err != nil {
+		panic(fmt.Errorf("💥  error updating config: %v", err))
+	}
+
+	// Fsck safety
+	if err := os.WriteFile(cfg_path, cfg_bytes, 0640); err != nil {
 		panic(fmt.Errorf("💥  error updating config: %v", err))
 	}
 }
