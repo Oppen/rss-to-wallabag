@@ -19,6 +19,9 @@ import (
  * 2. Make single file
  * 3. Maybe use explicit Marshal/Unmarshal implementations to build with tinygo
  *    This may help: https://github.com/json-iterator/tinygo
+ * 4. Maybe try to make it work in bounded memory
+ * 5. Add support for extracting links from public Telegram channels (The Crab News)
+ * 6. Add support for filtering links (to use the headlines/features RSS from LWN)
  */
 
 type Url struct {
