@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 
 	"github.com/mmcdole/gofeed"
@@ -19,18 +20,29 @@ import (
  * 2. Make single file
  * 3. Maybe use explicit Marshal/Unmarshal implementations to build with tinygo
  *    This may help: https://github.com/json-iterator/tinygo
- * 4. Maybe try to make it work in bounded memory
+ * 4. Maybe try to make it work in bounded memory (and in that case, do without GC)
  * 5. Add support for extracting links from public Telegram channels (The Crab News)
- * 6. Add support for filtering links (to use the headlines/features RSS from LWN)
  */
+
+type AtomLink struct {
+	Url string `xml:"href,attr"`
+}
+
+type Feed struct {
+	AtomLinks []AtomLink `xml:"entry>link"`
+	RssLinks  []string   `xml:"channel>item>link"`
+}
 
 type Url struct {
 	URL string `json:"url"`
 }
 
 type FeedItem struct {
-	URL        string `json:"url"`
-	LatestPost string `json:"latest_post"`
+	URL         string        `json:"url"`
+	LatestPost  string        `json:"latest_post"`
+	Redirect   *string        `json:"redirect,omitempty"`
+	TitleMatch *string        `json:"title_matching,omitempty"`
+	TitleRegex *regexp.Regexp `json:"-"`
 }
 
 type RunConfig struct {
@@ -58,6 +70,12 @@ func (cfg *Config) FillDefaults() {
 	}
 	if cfg.RunConfig.BatchSize == 0 {
 		cfg.RunConfig.BatchSize = 10
+	}
+	for i := range cfg.Feeds {
+		feed := &cfg.Feeds[i]
+		if feed.TitleMatch != nil {
+			feed.TitleRegex = regexp.MustCompile(*feed.TitleMatch)
+		}
 	}
 }
 
@@ -210,17 +228,24 @@ func dlWorker(done chan<- struct{}, feedCh <-chan *FeedItem, itemsCh chan<- []Ur
 		printCh<- fmt.Sprintf("🚀  downloaded %s", element.URL)
 
 		latest := element.LatestPost
+		filter := element.TitleRegex
+		redirect := element.Redirect
+		domainRE := regexp.MustCompile("^http(?:s)://[^/]+/")
 
 		// TODO: maybe use a pool
 		items := make([]Url, 0, len(feed.Items))
 		for _, element := range feed.Items {
-
 			if element.Link == latest {
 				break
-			} else {
-				item := Url{element.Link}
-				items = append(items, item)
 			}
+			if filter != nil && !filter.MatchString(element.Title) {
+				continue
+			}
+			item := Url{element.Link}
+			if redirect != nil {
+				item.URL = domainRE.ReplaceAllLiteralString(item.URL, *redirect)
+			}
+			items = append(items, item)
 		}
 		if len(feed.Items) > 0 {
 			element.LatestPost = feed.Items[0].Link
