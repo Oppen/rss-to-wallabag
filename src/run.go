@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"strings"
 
 	"github.com/mmcdole/gofeed"
 )
@@ -22,6 +23,7 @@ import (
  *    This may help: https://github.com/json-iterator/tinygo
  * 4. Maybe try to make it work in bounded memory (and in that case, do without GC)
  * 5. Add support for extracting links from public Telegram channels (The Crab News)
+ * 6. Make common variables globals, e.g. channels
  */
 
 type AtomLink struct {
@@ -215,22 +217,36 @@ func dlWorker(done chan<- struct{}, feedCh <-chan *FeedItem, itemsCh chan<- []Ur
 		done<- struct{}{}
 	}()
 
-	// Create a new RSS parser instance
 	fp := gofeed.NewParser()
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	domainRE := regexp.MustCompile("^http(?:s)://[^/]+/")
 
 	for element := range feedCh {
 		printCh<- fmt.Sprintf("🍺  downloading %s", element.URL)
-		feed, err := fp.ParseURL(element.URL)
+		res, err := client.Get(element.URL)
 		if err != nil {
-			errorCh<- fmt.Errorf("💥  %s: error parsing feed: %v", element.URL, err)
+			errorCh<- fmt.Errorf("💥  %s: error downloading feed: %v", element.URL, err)
+			io.Copy(ioutil.Discard, res.Body)
+			res.Body.Close()
 			continue
 		}
+
+		feed, err := fp.Parse(res.Body)
+		if err != nil {
+			errorCh<- fmt.Errorf("💥  %s: error parsing feed: %v", element.URL, err)
+			io.Copy(ioutil.Discard, res.Body)
+			res.Body.Close()
+			continue
+		}
+		io.Copy(ioutil.Discard, res.Body)
+		res.Body.Close()
+
 		printCh<- fmt.Sprintf("🚀  downloaded %s", element.URL)
 
 		latest := element.LatestPost
 		filter := element.TitleRegex
 		redirect := element.Redirect
-		domainRE := regexp.MustCompile("^http(?:s)://[^/]+/")
+		domain := domainRE.FindString(element.URL)
 
 		// TODO: maybe use a pool
 		items := make([]Url, 0, len(feed.Items))
@@ -242,6 +258,9 @@ func dlWorker(done chan<- struct{}, feedCh <-chan *FeedItem, itemsCh chan<- []Ur
 				continue
 			}
 			item := Url{element.Link}
+			if strings.HasPrefix(item.URL, "/") {
+				item.URL = domain + item.URL
+			}
 			if redirect != nil {
 				item.URL = domainRE.ReplaceAllLiteralString(item.URL, *redirect)
 			}
