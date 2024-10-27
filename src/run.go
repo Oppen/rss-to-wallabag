@@ -219,7 +219,7 @@ func dlWorker(done chan<- struct{}, feedCh <-chan *FeedItem, itemsCh chan<- []Ur
 
 	fp := gofeed.NewParser()
 	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
-	domainRE := regexp.MustCompile("^http(?:s)://[^/]+/")
+	domainRE := regexp.MustCompile("^http(?:s)?://[^/]+/")
 
 	for element := range feedCh {
 		printCh<- fmt.Sprintf("🍺  downloading %s", element.URL)
