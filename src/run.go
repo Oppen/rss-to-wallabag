@@ -147,6 +147,9 @@ func SendBatch(urls []Url, AccessToken string, baseUrl string, client *http.Clie
 		bearer := "Bearer " + AccessToken
 
 		req, err := http.NewRequest("POST", Url, nil)
+		if err != nil {
+			return fmt.Errorf("request creation failed: %v", err)
+		}
 		req.Header.Add("Authorization", bearer)
 		values := req.URL.Query()
 		values.Add(arg, string(b))
@@ -226,8 +229,10 @@ func dlWorker(done chan<- struct{}, feedCh <-chan *FeedItem, itemsCh chan<- []Ur
 		res, err := client.Get(element.URL)
 		if err != nil {
 			errorCh<- fmt.Errorf("💥  %s: error downloading feed: %v", element.URL, err)
-			io.Copy(ioutil.Discard, res.Body)
-			res.Body.Close()
+			if res != nil && res.Body != nil {
+				io.Copy(ioutil.Discard, res.Body)
+				res.Body.Close()
+			}
 			continue
 		}
 
