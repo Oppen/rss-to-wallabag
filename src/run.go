@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/mmcdole/gofeed"
 )
@@ -40,11 +41,15 @@ type Url struct {
 }
 
 type FeedItem struct {
-	URL         string        `json:"url"`
-	LatestPost  string        `json:"latest_post"`
-	Redirect   *string        `json:"redirect,omitempty"`
-	TitleMatch *string        `json:"title_matching,omitempty"`
-	TitleRegex *regexp.Regexp `json:"-"`
+	URL          string        `json:"url"`
+	LatestPost   string        `json:"latest_post"`
+	ETag        *string        `json:"e-tag,omitempty"`
+	ETagRemove  *string        `json:"e-tag_remove,omitempty"`
+	Modified    *string        `json:"last-modified,omitempty"`
+	StripParams  bool          `json:"strip_params,omitempty"`
+	Redirect    *string        `json:"redirect,omitempty"`
+	TitleMatch  *string        `json:"title_matching,omitempty"`
+	TitleRegex  *regexp.Regexp `json:"-"`
 }
 
 type RunConfig struct {
@@ -144,14 +149,13 @@ func SendBatch(urls []Url, AccessToken string, baseUrl string, client *http.Clie
 		if err != nil {
 			return fmt.Errorf("failed to marshal URL: %v", err)
 		}
-		bearer := "Bearer " + AccessToken
 
 		req, err := http.NewRequest("POST", Url, nil)
 		if err != nil {
 			return fmt.Errorf("request creation failed: %v", err)
 		}
-		req.Header.Add("Authorization", bearer)
 		values := req.URL.Query()
+		values.Add("access_token", AccessToken)
 		values.Add(arg, string(b))
 		req.URL.RawQuery = values.Encode()
 
@@ -226,7 +230,19 @@ func dlWorker(done chan<- struct{}, feedCh <-chan *FeedItem, itemsCh chan<- []Ur
 
 	for element := range feedCh {
 		printCh<- fmt.Sprintf("🍺  downloading %s", element.URL)
-		res, err := client.Get(element.URL)
+		req, err := http.NewRequest("GET", element.URL, nil)
+		if element.ETag != nil {
+			etag := *element.ETag
+			if element.ETagRemove != nil {
+				etag = strings.Replace(etag, *element.ETagRemove, "", 1)
+			}
+			req.Header.Add("If-None-Match", etag)
+		} else if element.Modified != nil {
+			req.Header.Add("If-Modified-Since", *element.Modified)
+		}
+		start := time.Now()
+		res, err := client.Do(req)
+		printCh<- fmt.Sprintf("%s: response after %v", element.URL, time.Since(start))
 		if err != nil {
 			errorCh<- fmt.Errorf("💥  %s: error downloading feed: %v", element.URL, err)
 			if res != nil && res.Body != nil {
@@ -234,6 +250,15 @@ func dlWorker(done chan<- struct{}, feedCh <-chan *FeedItem, itemsCh chan<- []Ur
 				res.Body.Close()
 			}
 			continue
+		}
+		if res.StatusCode == 304 {
+			printCh<- fmt.Sprintf("😎  %s: already up to date", element.URL)
+			io.Copy(ioutil.Discard, res.Body)
+			res.Body.Close()
+			continue
+		} else if element.ETag != nil && *element.ETag == res.Header.Get("ETag") {
+			errorCh<- fmt.Errorf("❌ %s: status: [%d] req-etag: [%s] res-etag: [%s]",
+			element.URL, res.StatusCode, req.Header.Get("If-None-Match"), res.Header.Get("ETag"))
 		}
 
 		feed, err := fp.Parse(res.Body)
@@ -248,6 +273,7 @@ func dlWorker(done chan<- struct{}, feedCh <-chan *FeedItem, itemsCh chan<- []Ur
 
 		printCh<- fmt.Sprintf("🚀  downloaded %s", element.URL)
 
+		strip := element.StripParams
 		latest := element.LatestPost
 		filter := element.TitleRegex
 		redirect := element.Redirect
@@ -269,10 +295,20 @@ func dlWorker(done chan<- struct{}, feedCh <-chan *FeedItem, itemsCh chan<- []Ur
 			if redirect != nil {
 				item.URL = domainRE.ReplaceAllLiteralString(item.URL, *redirect)
 			}
+			if strip {
+				stripped, _, _ := strings.Cut(item.URL, "?")
+				item.URL = stripped
+			}
 			items = append(items, item)
 		}
 		if len(feed.Items) > 0 {
 			element.LatestPost = feed.Items[0].Link
+		}
+		if etag := res.Header.Get("ETag"); etag != "" {
+			element.ETag = &etag
+		}
+		if modified := string(res.Header.Get("Last-Modified")); modified != "" {
+			element.Modified = &modified
 		}
 		itemsCh<- items
 	}
