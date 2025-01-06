@@ -1,4 +1,4 @@
-package gobag
+package main
 
 import (
 	"bytes"
@@ -415,4 +415,8 @@ func Run() {
 	if err := os.WriteFile(cfg_path, cfg_bytes, 0640); err != nil {
 		panic(fmt.Errorf("💥  error updating config: %v", err))
 	}
+}
+
+func main() {
+	Run()
 }
