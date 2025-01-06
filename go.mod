@@ -1,4 +1,4 @@
-module joshuaCrewe/go-rss-wallabag
+module pelito/rss2bag
 
 go 1.23
 

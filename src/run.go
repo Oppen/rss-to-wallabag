@@ -2,6 +2,7 @@ package gobag
 
 import (
 	"bytes"
+	_ "crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,16 +26,9 @@ import (
  * 4. Maybe try to make it work in bounded memory (and in that case, do without GC)
  * 5. Add support for extracting links from public Telegram channels (The Crab News)
  * 6. Make common variables globals, e.g. channels
+ * 7. Support localhost Wallabag
+ * 8. Env var config for credentials, operation parameters and feed database
  */
-
-type AtomLink struct {
-	Url string `xml:"href,attr"`
-}
-
-type Feed struct {
-	AtomLinks []AtomLink `xml:"entry>link"`
-	RssLinks  []string   `xml:"channel>item>link"`
-}
 
 type Url struct {
 	URL string `json:"url"`
@@ -52,6 +46,7 @@ type FeedItem struct {
 	TitleRegex  *regexp.Regexp `json:"-"`
 }
 
+// TODO: get from env
 type RunConfig struct {
 	NumDlJobs int `json:"num_dl_jobs"`
 	BatchSize int `json:"batch_size"`
@@ -86,6 +81,7 @@ func (cfg *Config) FillDefaults() {
 	}
 }
 
+// TODO: use the environment
 func Auth(bagcfg *BagConfig, client *http.Client) (string, error) {
 	type PostRequest struct {
 		GrantType    string `json:"grant_type"`
@@ -104,8 +100,15 @@ func Auth(bagcfg *BagConfig, client *http.Client) (string, error) {
 		getCreds(bagcfg.Password),
 	}
 	b, err := json.Marshal(jsonStr)
+	if err != nil {
+		return "", err
+	}
 
 	req, err := http.NewRequest("POST", baseURL, bytes.NewBuffer(b))
+	if err != nil {
+		return "", err
+	}
+
 	req.Header.Add("Content-Type", "application/json")
 	req.Header.Add("Accept", "application/json, */*;q=0.5")
 
@@ -231,6 +234,9 @@ func dlWorker(done chan<- struct{}, feedCh <-chan *FeedItem, itemsCh chan<- []Ur
 	for element := range feedCh {
 		printCh<- fmt.Sprintf("🍺  downloading %s", element.URL)
 		req, err := http.NewRequest("GET", element.URL, nil)
+		req.Header.Add("Accept", "application/xml, application/atom+xml, application/rss+xml, text/xml")
+		req.Header.Add("Connection", "close")
+		req.Close = true
 		if element.ETag != nil {
 			etag := *element.ETag
 			if element.ETagRemove != nil {
@@ -341,6 +347,9 @@ func printWorker(doneCh chan<- struct{}, printCh <-chan string, errorCh <-chan e
 }
 
 func Run() {
+	// FIXME: greatly insecure, I'm too lazy to renew certs right now
+	//http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+
 	cfg_path, ok := os.LookupEnv("RSS2BAG_CONFIG")
 	if !ok {
 		cfg_path = os.ExpandEnv("$HOME/.local/share/go-rss-to-wallabag/config.json")
