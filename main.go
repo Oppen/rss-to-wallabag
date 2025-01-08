@@ -23,6 +23,7 @@ import (
 var (
 	NumDlJobs    int = 10
 	BatchSize    int = 10
+	Verbose      bool = false
 
 	LocalConnect bool = false
 	BagUrl       string
@@ -36,44 +37,44 @@ var (
 var (
 	dnsResolverTimeoutMsecs int = 5000
 	dnsResolverProto        string = "udp"
-	dnsResolverIp           string = "1.1.1.1"
+	dnsResolverIp           string = "1.1.1.1:53"
 
 	printCh chan string
 	errorCh chan error
 )
 
 func init() {
-	if v, ok := os.LookupEnv("BAG2RSS_NUM_DL_JOBS"); ok {
+	if v, ok := os.LookupEnv("RSS2BAG_NUM_DL_JOBS"); ok {
 		jobs, err := strconv.ParseInt(v, 10, 16)
 		if err != nil {
-			panic("invalid BAG2RSS_NUM_DL_JOBS")
+			panic("invalid RSS2BAG_NUM_DL_JOBS")
 		}
 		NumDlJobs = int(jobs)
 	}
-	if v, ok := os.LookupEnv("BAG2RSS_BATCH_SIZE"); ok {
+	if v, ok := os.LookupEnv("RSS2BAG_BATCH_SIZE"); ok {
 		batch, err := strconv.ParseInt(v, 10, 16)
 		if err != nil {
-			panic("invalid BAG2RSS_BATCH_SIZE")
+			panic("invalid RSS2BAG_BATCH_SIZE")
 		}
 		BatchSize = int(batch)
 	}
-	_, LocalConnect = os.LookupEnv("BAG2RSS_LOCAL_CONNECT")
+	_, LocalConnect = os.LookupEnv("RSS2BAG_LOCAL_CONNECT")
 
 	var ok bool
-	if BagUrl, ok = os.LookupEnv("BAG2RSS_BAG_URL"); !ok {
-		panic("invalid BAG2RSS_BAG_URL")
+	if BagUrl, ok = os.LookupEnv("RSS2BAG_BAG_URL"); !ok {
+		panic("invalid RSS2BAG_BAG_URL")
 	}
-	if ClientID, ok = os.LookupEnv("BAG2RSS_CLIENT_ID"); !ok {
-		panic("invalid BAG2RSS_CLIENT_ID")
+	if ClientID, ok = os.LookupEnv("RSS2BAG_CLIENT_ID"); !ok {
+		panic("invalid RSS2BAG_CLIENT_ID")
 	}
-	if ClientSecret, ok = os.LookupEnv("BAG2RSS_CLIENT_SECRET"); !ok {
-		panic("invalid BAG2RSS_CLIENT_SECRET")
+	if ClientSecret, ok = os.LookupEnv("RSS2BAG_CLIENT_SECRET"); !ok {
+		panic("invalid RSS2BAG_CLIENT_SECRET")
 	}
-	if Username, ok = os.LookupEnv("BAG2RSS_USERNAME"); !ok {
-		panic("invalid BAG2RSS_USERNAME")
+	if Username, ok = os.LookupEnv("RSS2BAG_USERNAME"); !ok {
+		panic("invalid RSS2BAG_USERNAME")
 	}
-	if Password, ok = os.LookupEnv("BAG2RSS_PASSWORD"); !ok {
-		panic("invalid BAG2RSS_PASSWORD")
+	if Password, ok = os.LookupEnv("RSS2BAG_PASSWORD"); !ok {
+		panic("invalid RSS2BAG_PASSWORD")
 	}
 
 	printCh = make(chan string, 8192)
@@ -85,10 +86,12 @@ func init() {
  * 2. Maybe use explicit Marshal/Unmarshal implementations to build with tinygo
  *    This may help: https://github.com/json-iterator/tinygo
  *    Or: https://github.com/buger/jsonparser
+ *    Or: https://github.com/mailru/easyjson
+ *    Or: encoding/json itself, supposedly reflection works now
  * 3. Maybe try to make it work in bounded memory (and in that case, do without GC)
  * 4. Add support for extracting links from public Telegram channels (The Crab News)
  * 5. Make common variables globals, e.g. channels
- * 8. Stdin+Stdout for feeds
+ * 6. Unify print and orchestrator routines with select
  * 9. Execline script for orchestrating everything
  */
 
@@ -204,12 +207,12 @@ func SendBatch(urls []Url, AccessToken string, client *http.Client) error {
 	return nil
 }
 
-func ulWorker(accessToken string, batchSize int, client *http.Client, done chan<- struct{}, itemsCh <-chan []Url) {
+func ulWorker(accessToken string, client *http.Client, done chan<- struct{}, itemsCh <-chan []Url) {
 	defer func() {
 		done<- struct{}{}
 	}()
 
-	batch := make([]Url, 0, batchSize)
+	batch := make([]Url, 0, BatchSize)
 
 	flush := func() {
 		defer func() {
@@ -229,8 +232,8 @@ func ulWorker(accessToken string, batchSize int, client *http.Client, done chan<
 	}
 
 	for items := range itemsCh {
-		for len(items) + len(batch) >= batchSize {
-			toAppend := batchSize-len(batch)
+		for len(items) + len(batch) >= BatchSize {
+			toAppend := BatchSize-len(batch)
 			batch = append(batch, items[:toAppend]...)
 			flush()
 			items = items[toAppend:]
@@ -369,7 +372,9 @@ func printWorker(doneCh chan<- struct{}) {
 				printCh = nil
 				continue
 			}
-			fmt.Println(line)
+			if Verbose {
+				fmt.Fprintln(os.Stderr, line)
+			}
 		case line, ok := <-errorCh:
 			if !ok {
 				errorCh = nil
@@ -381,24 +386,15 @@ func printWorker(doneCh chan<- struct{}) {
 }
 
 func main() {
-	cfg_path, ok := os.LookupEnv("RSS2BAG_CONFIG")
-	if !ok {
-		cfg_path = os.ExpandEnv("$HOME/.local/share/go-rss-to-wallabag/config.json")
-	}
-
-	cfg_bytes, err := os.ReadFile(cfg_path)
-	if err != nil {
-		panic(fmt.Errorf("💥  error reading config: %v", err))
-	}
-
 	var cfg Config
-	if err := json.Unmarshal(cfg_bytes, &cfg); err != nil {
-		panic(fmt.Errorf("💥  error parsing config: %v", err))
+	dec := json.NewDecoder(os.Stdin)
+	if err := dec.Decode(&cfg); err != nil {
+		panic(fmt.Errorf("💥  error reading feeds: %v", err))
 	}
 	cfg.FillDefaults()
 
 	client := &http.Client{}
-	fmt.Println("🚀  Authenticating with Walabag instance: ", BagUrl)
+	fmt.Fprintln(os.Stderr, "🚀  Authenticating with Walabag instance: ", BagUrl)
 	access_token, err := Auth(client)
 	if err != nil {
 		panic(fmt.Errorf("💥  authentication failed: %v", err))
@@ -416,7 +412,7 @@ func main() {
 		go dlWorker(dlDoneCh, feedCh, itemsCh)
 	}
 
-	go ulWorker(access_token, BatchSize, client, ulDoneCh, itemsCh)
+	go ulWorker(access_token, client, ulDoneCh, itemsCh)
 
 	for i := range cfg.Feeds {
 		element := &cfg.Feeds[i]
@@ -435,13 +431,9 @@ func main() {
 	close(errorCh)
 	_ = <-printDone
 
-	cfg_bytes, err = json.MarshalIndent(&cfg, "", "    ")
-	if err != nil {
-		panic(fmt.Errorf("💥  error updating config: %v", err))
-	}
-
-	// Fsck safety
-	if err := os.WriteFile(cfg_path, cfg_bytes, 0640); err != nil {
-		panic(fmt.Errorf("💥  error updating config: %v", err))
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "    ")
+	if err := enc.Encode(&cfg); err != nil {
+		panic(fmt.Errorf("💥  error writing feeds: %v", err))
 	}
 }
