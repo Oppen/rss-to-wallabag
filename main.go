@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -430,6 +431,10 @@ func main() {
 	close(printCh)
 	close(errorCh)
 	_ = <-printDone
+
+	slices.SortFunc(cfg.Feeds, func(lhs, rhs FeedItem) int {
+		return strings.Compare(lhs.URL, rhs.URL)
+	})
 
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "    ")
