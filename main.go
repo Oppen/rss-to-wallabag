@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/mmcdole/gofeed"
+	"golang.org/x/net/html/charset"
 )
 
 // Environment
@@ -272,8 +273,10 @@ func dlWorker(done chan<- struct{}, feedCh <-chan *FeedItem, itemsCh chan<- []Ur
 	for element := range feedCh {
 		printCh<- fmt.Sprintf("🍺  downloading %s", element.URL)
 		req, err := http.NewRequest("GET", element.URL, nil)
-		req.Header.Add("Accept", "application/xml, application/atom+xml, application/rss+xml, text/xml")
-		req.Header.Add("Connection", "close")
+		req.Header.Set("Connection", "close")
+		// TODO: this will need to be a per-feed option with the honest default.
+		// Some blogs don't like custom, some don't like Golang's default.
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0")
 		req.Close = true
 		if element.ETag != nil {
 			etag := *element.ETag
@@ -305,7 +308,24 @@ func dlWorker(done chan<- struct{}, feedCh <-chan *FeedItem, itemsCh chan<- []Ur
 			element.URL, res.StatusCode, req.Header.Get("If-None-Match"), res.Header.Get("ETag"))
 		}
 
-		feed, err := fp.Parse(res.Body)
+		if res.StatusCode / 100 != 2 {
+			errorCh<- fmt.Errorf("💥  %s: feed download returned: %s", element.URL, res.Status)
+			if res != nil && res.Body != nil {
+				io.Copy(ioutil.Discard, res.Body)
+				res.Body.Close()
+			}
+			continue
+		}
+
+		r, err := charset.NewReader(res.Body, res.Header.Get("Content-Type"))
+		if err != nil {
+			errorCh<- fmt.Errorf("💥  %s: error detecting feed encoding: %v", element.URL, err)
+			io.Copy(ioutil.Discard, res.Body)
+			res.Body.Close()
+			continue
+		}
+
+		feed, err := fp.Parse(r)
 		if err != nil {
 			errorCh<- fmt.Errorf("💥  %s: error parsing feed: %v", element.URL, err)
 			io.Copy(ioutil.Discard, res.Body)
