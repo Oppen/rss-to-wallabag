@@ -39,8 +39,14 @@ var (
 	dnsResolverProto        string = "udp"
 	dnsResolverIp           string = "1.1.1.1:53"
 
+	client *http.Client
+
 	printCh chan string
 	errorCh chan error
+
+	feedCh     chan *FeedItem
+	articlesCh chan Article
+	linksCh    chan []Url
 
 	dlWg    sync.WaitGroup
 	ulWg    sync.WaitGroup
@@ -75,23 +81,34 @@ func init() {
 		panic("invalid RSS2BAG_ACCESS_TOKEN")
 	}
 
+	dialer := &net.Dialer{
+		Resolver: &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				d := net.Dialer{Timeout: time.Duration(dnsResolverTimeoutMsecs) * time.Millisecond}
+				return d.DialContext(ctx, dnsResolverProto, dnsResolverIp)
+			},
+		},
+	}
+	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return dialer.DialContext(ctx, network, addr)
+	}
+	transport := &http.Transport{DisableKeepAlives: true, DialContext: dialContext}
+	client = &http.Client{Transport: transport}
+
+	linksCh = make(chan []Url, NumDlJobs*2)
+	articlesCh = make(chan Article, NumDlJobs*2)
+	feedCh = make(chan *FeedItem, NumDlJobs*2)
+
 	printCh = make(chan string, 8192)
 	errorCh = make(chan error, 8192)
 }
 
-/* TODO:
- * 0. Improve filter error handling
- * 1. Replace gofeed with stdlib xml, only extract links
- * 2. Maybe use explicit Marshal/Unmarshal implementations to build with tinygo
- *    This may help: https://github.com/json-iterator/tinygo
- *    Or: https://github.com/buger/jsonparser
- *    Or: https://github.com/mailru/easyjson
- *    Or: encoding/json itself, supposedly reflection works now
- * 3. Maybe try to make it work in bounded memory (and in that case, do without GC)
- * 6. Unify print and orchestrator routines with select
- * 9. Execline script for orchestrating everything
- */
-
+type Article struct {
+	Url     string
+	Title   string
+	Content string
+}
 type Url string
 type FilterFunc func(*gofeed.Feed) *gofeed.Feed
 type FilterConfig struct {
@@ -99,14 +116,15 @@ type FilterConfig struct {
 	Args json.RawMessage `json:"args,omitempty"`
 }
 type FeedItem struct {
-	URL        string         `json:"url"`
-	UserAgent  string         `json:"user_agent,omitempty"`
-	LatestPost string         `json:"latest_post,omitempty"`
-	ETag       *string        `json:"etag,omitempty"`
-	ETagRemove *string        `json:"etag_remove,omitempty"`
-	Modified   *string        `json:"last_modified,omitempty"`
-	Filters    []FilterConfig `json:"filters,omitempty"`
-	FiltersFns []FilterFunc   `json:"-"`
+	URL         string         `json:"url"`
+	UserAgent   string         `json:"user_agent,omitempty"`
+	LatestPost  string         `json:"latest_post,omitempty"`
+	SendContent bool           `json:"send_content,omitempty"`
+	ETag        string         `json:"etag,omitempty"`
+	ETagRemove  string         `json:"etag_remove,omitempty"`
+	Modified    string         `json:"last_modified,omitempty"`
+	Filters     []FilterConfig `json:"filters,omitempty"`
+	FiltersFns  []FilterFunc   `json:"-"`
 }
 type Config []FeedItem
 
@@ -240,43 +258,51 @@ func buildFilter(name string, args json.RawMessage) FilterFunc {
 	return nil
 }
 
-func SendBatch(urls []Url, client *http.Client) error {
-	post := func(Url string, arg string, payload any) error {
-		b, err := json.Marshal(payload)
+func Post(url string, args []string, payloads []any) error {
+	req, err := http.NewRequest("POST", url, nil)
+	if err != nil {
+		return fmt.Errorf("request creation failed: %v", err)
+	}
+	if LocalConnect {
+		req.RemoteAddr = "127.0.0.1:80"
+	}
+	values := req.URL.Query()
+	values.Add("access_token", AccessToken)
+
+	for i := range args {
+		b, err := json.Marshal(payloads[i])
 		if err != nil {
 			return fmt.Errorf("failed to marshal URL: %v", err)
 		}
 
-		req, err := http.NewRequest("POST", Url, nil)
-		if err != nil {
-			return fmt.Errorf("request creation failed: %v", err)
-		}
-		if LocalConnect {
-			req.RemoteAddr = "127.0.0.1:80"
-		}
-		values := req.URL.Query()
-		values.Add("access_token", AccessToken)
-		values.Add(arg, string(b))
-		req.URL.RawQuery = values.Encode()
-
-		resp, err := client.Do(req)
-		if err != nil {
-			return fmt.Errorf("upload failed: %v", err)
-		}
-		defer consumeResponse(resp)
-		if resp.StatusCode != 200 {
-			return fmt.Errorf("response returned status code: %s", resp.Status)
-		}
-		return nil
+		values.Add(args[i], string(b))
 	}
+	req.URL.RawQuery = values.Encode()
 
-	if err := post(BagUrl+"api/entries/lists", "urls", urls); err != nil {
+	resp, err := client.Do(req)
+	if err != nil {
 		return fmt.Errorf("upload failed: %v", err)
+	}
+	defer consumeResponse(resp)
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("response returned status code: %s", resp.Status)
 	}
 	return nil
 }
 
-func ulWorker(client *http.Client, itemsCh <-chan []Url) {
+func articleUlWorker() {
+	defer ulWg.Done()
+	for items := range articlesCh {
+		err := Post(BagUrl+"api/entries", []string{"url", "title", "content"}, []any{items.Url, items.Title, items.Content})
+		if err != nil {
+			errorCh <- fmt.Errorf("💥  %s: upload error: %v", items.Url, err)
+			continue
+		}
+		printCh <- fmt.Sprintf("🚀  uploaded %s", items.Url)
+	}
+}
+
+func linkUlWorker() {
 	defer ulWg.Done()
 	batch := make([]Url, 0, BatchSize)
 
@@ -285,7 +311,7 @@ func ulWorker(client *http.Client, itemsCh <-chan []Url) {
 			batch = batch[:0]
 		}()
 
-		err := SendBatch(batch, client)
+		err := Post(BagUrl+"api/entries/lists", []string{"urls"}, []any{batch})
 		if err != nil {
 			for _, item := range batch {
 				errorCh <- fmt.Errorf("💥  %s: upload error: %v", item, err)
@@ -297,8 +323,8 @@ func ulWorker(client *http.Client, itemsCh <-chan []Url) {
 		}
 	}
 
-	for items := range itemsCh {
-		batches := len(itemsCh) + 1
+	for items := range linksCh {
+		batches := len(linksCh) + 1
 		for i := range batches {
 			for len(items)+len(batch) >= BatchSize {
 				toAppend := BatchSize - len(batch)
@@ -308,30 +334,16 @@ func ulWorker(client *http.Client, itemsCh <-chan []Url) {
 			}
 			batch = append(batch, items...)
 			if i < batches-1 {
-				items = <-itemsCh
+				items = <-linksCh
 			}
 		}
 		flush()
 	}
 }
 
-func dlWorker(feedCh <-chan *FeedItem, itemsCh chan<- []Url) {
+func dlWorker() {
 	defer dlWg.Done()
 	fp := gofeed.NewParser()
-	dialer := &net.Dialer{
-		Resolver: &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				d := net.Dialer{Timeout: time.Duration(dnsResolverTimeoutMsecs) * time.Millisecond}
-				return d.DialContext(ctx, dnsResolverProto, dnsResolverIp)
-			},
-		},
-	}
-	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return dialer.DialContext(ctx, network, addr)
-	}
-	transport := &http.Transport{DisableKeepAlives: true, DialContext: dialContext}
-	client := &http.Client{Transport: transport}
 
 	for element := range feedCh {
 		printCh <- fmt.Sprintf("🍺  downloading %s", element.URL)
@@ -340,14 +352,14 @@ func dlWorker(feedCh <-chan *FeedItem, itemsCh chan<- []Url) {
 		//"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0"
 		req.Header.Set("User-Agent", element.UserAgent)
 		req.Close = true
-		if element.ETag != nil {
-			etag := *element.ETag
-			if element.ETagRemove != nil {
-				etag = strings.Replace(etag, *element.ETagRemove, "", 1)
+		if element.ETag != "" {
+			etag := element.ETag
+			if element.ETagRemove != "" {
+				etag = strings.Replace(etag, element.ETagRemove, "", 1)
 			}
 			req.Header.Add("If-None-Match", etag)
-		} else if element.Modified != nil {
-			req.Header.Add("If-Modified-Since", *element.Modified)
+		} else if element.Modified != "" {
+			req.Header.Add("If-Modified-Since", element.Modified)
 		}
 		start := time.Now()
 		res, err := client.Do(req)
@@ -360,7 +372,7 @@ func dlWorker(feedCh <-chan *FeedItem, itemsCh chan<- []Url) {
 			if res.StatusCode == 304 {
 				printCh <- fmt.Sprintf("😎  %s: already up to date", element.URL)
 				return nil, nil
-			} else if element.ETag != nil && *element.ETag == res.Header.Get("ETag") {
+			} else if element.ETag != "" && element.ETag == res.Header.Get("ETag") {
 				return nil, fmt.Errorf("💥  %s: status: [%d] req-etag: [%s] res-etag: [%s]",
 					element.URL, res.StatusCode, req.Header.Get("If-None-Match"), res.Header.Get("ETag"))
 			}
@@ -395,21 +407,25 @@ func dlWorker(feedCh <-chan *FeedItem, itemsCh chan<- []Url) {
 			feed = filter(feed)
 		}
 
-		// TODO: maybe use a pool
-		items := make([]Url, 0, len(feed.Items))
-		for _, element := range feed.Items {
-			items = append(items, Url(element.Link))
+		if element.SendContent {
+			articlesCh <- Article{element.URL, feed.Title, feed.Description}
+		} else {
+			// TODO: maybe use a pool
+			items := make([]Url, 0, len(feed.Items))
+			for _, element := range feed.Items {
+				items = append(items, Url(element.Link))
+			}
+			linksCh <- items
 		}
 		if len(feed.Items) > 0 {
 			element.LatestPost = feed.Items[0].Link
 		}
 		if etag := res.Header.Get("ETag"); etag != "" {
-			element.ETag = &etag
+			element.ETag = etag
 		}
 		if modified := string(res.Header.Get("Last-Modified")); modified != "" {
-			element.Modified = &modified
+			element.Modified = modified
 		}
-		itemsCh <- items
 	}
 }
 
@@ -448,20 +464,15 @@ func main() {
 	cfg.FillDefaults()
 
 	dlWg.Add(NumDlJobs)
-	ulWg.Add(1)
+	ulWg.Add(2)
 	printWg.Add(1)
 
-	client := &http.Client{}
-
 	go printWorker()
-
-	feedCh := make(chan *FeedItem, NumDlJobs*2)
-	itemsCh := make(chan []Url, NumDlJobs*2)
 	for range NumDlJobs {
-		go dlWorker(feedCh, itemsCh)
+		go dlWorker()
 	}
-
-	go ulWorker(client, itemsCh)
+	go articleUlWorker()
+	go linkUlWorker()
 
 	for i := range cfg {
 		element := &cfg[i]
@@ -470,7 +481,8 @@ func main() {
 	close(feedCh)
 
 	dlWg.Wait()
-	close(itemsCh)
+	close(articlesCh)
+	close(linksCh)
 	ulWg.Wait()
 	close(printCh)
 	close(errorCh)
@@ -479,6 +491,11 @@ func main() {
 	slices.SortFunc(cfg, func(lhs, rhs FeedItem) int {
 		return strings.Compare(lhs.URL, rhs.URL)
 	})
+	for i := range cfg {
+		if cfg[i].UserAgent == UserAgent {
+			cfg[i].UserAgent = ""
+		}
+	}
 
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "    ")
